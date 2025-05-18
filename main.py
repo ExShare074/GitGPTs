@@ -2,18 +2,16 @@ from flask import Flask, request, jsonify
 from github import Github
 from github.GithubException import UnknownObjectException, GithubException
 import config
-print(">> Loaded token prefix:", config.github_token[:8], "…, user:", config.github_user)
-
-
-
+print(">> Using token:", repr(config.github_token))
+print(">> Using user: ", repr(config.github_user))
 app = Flask(__name__)
 
-# Загрузка конфига
+# Загрузка конфигурации
 github_token = config.github_token
 github_user = config.github_user
 
 if not github_token:
-    raise RuntimeError('Please set github_token in config.py')
+    raise RuntimeError('Пожалуйста, установите github_token в config.py')
 
 g = Github(github_token)
 
@@ -23,6 +21,12 @@ def get_repository(repo_name):
         return g.get_repo(f"{github_user}/{repo_name}")
     except UnknownObjectException:
         return None
+
+@app.route('/')
+def index():
+    return jsonify({
+        "message": "API работает. Используйте /repo/<repo>/structure или другие доступные маршруты."
+    })
 
 # 1) Структура репозитория
 @app.route('/repo/<repo>/structure', methods=['GET'])
@@ -35,17 +39,15 @@ def get_structure(repo):
         return jsonify({'error': f"Репозиторий '{repo}' не найден"}), 404
 
     try:
-        # Имя ветки и её реф HEADS
         branch_name = branch or repository.default_branch
         ref = repository.get_git_ref(f"heads/{branch_name}")
         sha = ref.object.sha
 
-        # Получаем дерево по SHA
         tree = repository.get_git_tree(sha, recursive=True).tree
 
         def build_tree(base_path):
             items = []
-            prefix = base_path.rstrip('/') + '/'
+            prefix = base_path.rstrip('/') + '/' if base_path else ''
             for element in tree:
                 if (not base_path and '/' not in element.path) or \
                    (base_path and element.path.startswith(prefix) and element.path != base_path):
@@ -59,7 +61,7 @@ def get_structure(repo):
     except UnknownObjectException:
         return jsonify({'error': f"Ветка '{branch_name}' не найдена"}), 404
     except GithubException as e:
-        return jsonify({'error': f"GitHub API error: {e.data.get('message', str(e))}"}), e.status
+        return jsonify({'error': f"Ошибка GitHub API: {e.data.get('message', str(e))}"}), e.status
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -86,19 +88,18 @@ def get_file(repo, filepath):
 # 3) Создать новый файл
 @app.route('/repo/<repo>/file', methods=['POST'])
 def create_file(repo):
-    data = request.get_json()
     raw = request.data.decode('utf-8')
     print(">> Raw POST data:", raw)
     try:
         data = request.get_json(force=True)
     except Exception as ex:
-        print(">> JSON parse error:", ex)
-        return jsonify({'error': f'Invalid JSON: {ex}'}), 400
+        return jsonify({'error': f'Неверный JSON: {ex}'}), 400
+
     branch = data.get('branch', None)
     file_path = data.get('path', '')
     file_name = data.get('name')
     content = data.get('content', '')
-    message = data.get('message', 'Create new file via API')
+    message = data.get('message', 'Создание нового файла через API')
 
     repository = get_repository(repo)
     if not repository:
@@ -115,6 +116,99 @@ def create_file(repo):
         return jsonify({'error': 'Не удалось создать файл: путь или ветка не найдены'}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+# 4) Просмотреть все файлы со вcех вложений и их содержимое
+@app.route('/repo/<repo>/all', methods=['GET'])
+def get_all(repo):
+    branch = request.args.get('branch', None)
+    repository = get_repository(repo)
+    if not repository:
+        return jsonify({'error': f"Репозиторий '{repo}' не найден"}), 404
+
+    # получаем SHA нужной ветки
+    branch_name = branch or repository.default_branch
+    ref = repository.get_git_ref(f"heads/{branch_name}")
+    sha = ref.object.sha
+
+    # полное дерево
+    tree = repository.get_git_tree(sha, recursive=True).tree
+
+    files = []
+    for element in tree:
+        if element.type == 'blob':
+            try:
+                content_file = repository.get_contents(element.path, ref=branch_name)
+                text = content_file.decoded_content.decode('utf-8')
+            except Exception:
+                text = None
+            files.append({'path': element.path, 'content': text})
+
+    return jsonify({'files': files})
+
+
+# 5) Обновить существующий файл
+@app.route('/repo/<repo>/file/<path:filepath>', methods=['PUT'])
+def update_file(repo, filepath):
+    try:
+        data = request.get_json(force=True)
+    except Exception as ex:
+        return jsonify({'error': f'Неверный JSON: {ex}'}), 400
+
+    branch = data.get('branch', None)
+    new_content = data.get('content', '')
+    message = data.get('message', 'Update file via API')
+
+    repository = get_repository(repo)
+    if not repository:
+        return jsonify({'error': f"Репозиторий '{repo}' не найден"}), 404
+
+    try:
+        # получаем текущий файл, чтобы взять его SHA
+        file_obj = repository.get_contents(filepath, ref=branch or repository.default_branch)
+        repository.update_file(
+            path=filepath,
+            message=message,
+            content=new_content,
+            sha=file_obj.sha,
+            branch=branch or repository.default_branch
+        )
+        return jsonify({'message': 'Файл обновлён', 'path': filepath})
+    except UnknownObjectException:
+        return jsonify({'error': f"Файл '{filepath}' не найден"}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# 6) Удалить файл
+@app.route('/repo/<repo>/file/<path:filepath>', methods=['DELETE'])
+def delete_file(repo, filepath):
+    try:
+        data = request.get_json(force=True)
+    except Exception as ex:
+        return jsonify({'error': f'Неверный JSON: {ex}'}), 400
+
+    branch = data.get('branch', None)
+    message = data.get('message', 'Delete file via API')
+
+    repository = get_repository(repo)
+    if not repository:
+        return jsonify({'error': f"Репозиторий '{repo}' не найден"}), 404
+
+    try:
+        # получаем SHA файла для удаления
+        file_obj = repository.get_contents(filepath, ref=branch or repository.default_branch)
+        repository.delete_file(
+            path=filepath,
+            message=message,
+            sha=file_obj.sha,
+            branch=branch or repository.default_branch
+        )
+        return jsonify({'message': 'Файл удалён', 'path': filepath})
+    except UnknownObjectException:
+        return jsonify({'error': f"Файл '{filepath}' не найден"}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
